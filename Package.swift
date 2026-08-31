@@ -11,6 +11,9 @@ let package = Package(
         .package(url: "https://github.com/vapor/vapor.git", from: "4.121.4"),
         // 🔵 Non-blocking, event-driven networking for Swift. Used for custom executors
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.101.0"),
+        // HTTP Networking
+        .package(url: "https://github.com/Alamofire/Alamofire.git", from: "5.12.0"),
+        .package(url: "https://github.com/swift-server/async-http-client.git", from: "1.36.0"),
     ],
     targets: [
         .executableTarget(
@@ -19,6 +22,8 @@ let package = Package(
                 .product(name: "Vapor", package: "vapor"),
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "Alamofire", package: "Alamofire"),
+                .product(name: "AsyncHTTPClient", package: "async-http-client"),
             ],
             swiftSettings: swiftSettings
         ),

@@ -116,6 +116,59 @@ struct ConversationTests {
         #expect(input.dropFirst().map { $0["content"] } == ["내 이름은 지훈", "반갑습니다.", "내 이름은?"])
         #expect(json["store"] as? Bool == false)
         #expect(json["stream"] as? Bool == true)
+        let tools = try #require(json["tools"] as? [[String: Any]])
+        #expect(tools.map { $0["type"] as? String } == ["web_search", "function"])
+        #expect(tools.last?["name"] as? String == "generate_image")
+    }
+
+    @Test("Web citations become clickable Telegram Markdown links")
+    func webCitations() throws {
+        let marker = "citeturn0search0"
+        let text = "오늘 소식입니다. \(marker)"
+        let startIndex = "오늘 소식입니다. ".utf16.count
+        let response: [String: Any] = [
+            "status": "completed",
+            "output": [
+                ["type": "web_search_call", "status": "completed"],
+                [
+                    "type": "message",
+                    "status": "completed",
+                    "content": [[
+                        "type": "output_text",
+                        "text": text,
+                        "annotations": [[
+                            "type": "url_citation",
+                            "start_index": startIndex,
+                            "end_index": text.utf16.count,
+                            "url": "https://example.com/news",
+                            "title": "뉴스"
+                        ]]
+                    ]]
+                ]
+            ]
+        ]
+        let data = try JSONSerialization.data(withJSONObject: response)
+
+        let reply = try JSONDecoder().decode(ResponsesResult.self, from: data).reply()
+        guard case .text(let rendered) = reply else {
+            Issue.record("Expected a text response")
+            return
+        }
+        #expect(rendered == "오늘 소식입니다. [출처](https://example.com/news)")
+    }
+
+    @Test("Invalid citation ranges fall back to a deduplicated source list")
+    func citationFallback() {
+        let citation = WebCitation(
+            type: "url_citation",
+            startIndex: 100,
+            endIndex: 110,
+            url: "https://example.com/news",
+            title: "뉴스 [원문]"
+        )
+
+        #expect(renderCitations(in: "답변", citations: [citation, citation]) ==
+            "답변\n\n### 출처\n- [뉴스 \\[원문\\]](https://example.com/news)")
     }
 
     @Test("Only the reset command clears memory")

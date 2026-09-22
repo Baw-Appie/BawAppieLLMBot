@@ -16,6 +16,12 @@ export OPENAI_IMAGE_MODEL="gpt-image-2.5-flare"
 
 `OPENAI_MODEL` is optional and defaults to `gpt-5.6-luna`.
 
+## Web search
+
+The bot can automatically use OpenAI Responses web search for current or
+time-sensitive questions and when the user explicitly asks it to search or verify
+something online. Search answers include clickable source links in Telegram.
+
 ## Conversation memory
 
 The bot remembers the latest 20 successfully delivered question/answer pairs per

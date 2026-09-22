@@ -125,7 +125,9 @@ struct OpenAI {
                         "call generate_image with a self-contained prompt preserving their requested details. " +
                         "No special command is needed. Do not call it for questions about images, requests for " +
                         "drawing instructions or code, quoted examples, or requests not to generate an image. " +
-                        "If the subject is unclear, ask a short clarification. Generate at most one image."
+                        "If the subject is unclear, ask a short clarification. Generate at most one image. " +
+                        "Use web search when the user asks for current, recent, or otherwise time-sensitive information, " +
+                        "or explicitly asks you to search or verify something on the web."
                 )
             ] + history.map { .init(role: $0.role.rawValue, content: $0.content) } + [
                 .init(role: "user", content: userText)
@@ -156,7 +158,10 @@ struct OpenAI {
         let model: String
         let stream = true
         let store = false
-        let tools = [ImageGenerationTool()]
+        let tools: [ResponsesTool] = [
+            .webSearch(WebSearchTool()),
+            .imageGeneration(ImageGenerationTool())
+        ]
         let parallelToolCalls = false
 
         enum CodingKeys: String, CodingKey {
@@ -217,6 +222,24 @@ enum OpenAIReply {
     case image(prompt: String)
 }
 
+private struct WebSearchTool: Encodable {
+    let type = "web_search"
+}
+
+private enum ResponsesTool: Encodable {
+    case webSearch(WebSearchTool)
+    case imageGeneration(ImageGenerationTool)
+
+    func encode(to encoder: any Encoder) throws {
+        switch self {
+        case .webSearch(let tool):
+            try tool.encode(to: encoder)
+        case .imageGeneration(let tool):
+            try tool.encode(to: encoder)
+        }
+    }
+}
+
 private struct ImageGenerationTool: Encodable {
     let type = "function"
     let name = "generate_image"
@@ -245,11 +268,12 @@ private struct ResponsesStreamEvent: Decodable {
     let message: String?
 }
 
-private struct ResponsesOutputItem: Decodable {
+struct ResponsesOutputItem: Decodable {
     struct Content: Decodable {
         let type: String
         let text: String?
         let refusal: String?
+        let annotations: [WebCitation]?
     }
 
     let type: String
@@ -259,7 +283,21 @@ private struct ResponsesOutputItem: Decodable {
     let content: [Content]?
 }
 
-private struct ResponsesResult: Decodable {
+struct WebCitation: Decodable {
+    let type: String
+    let startIndex: Int?
+    let endIndex: Int?
+    let url: String?
+    let title: String?
+
+    enum CodingKeys: String, CodingKey {
+        case type, url, title
+        case startIndex = "start_index"
+        case endIndex = "end_index"
+    }
+}
+
+struct ResponsesResult: Decodable {
     struct APIError: Decodable {
         let message: String
     }
@@ -301,11 +339,63 @@ private struct ResponsesResult: Decodable {
         let text = output.filter { $0.type == "message" }.flatMap { $0.content ?? [] }
             .compactMap { content -> String? in
                 switch content.type {
-                case "output_text": return content.text
+                case "output_text":
+                    guard let text = content.text else { return nil }
+                    return renderCitations(in: text, citations: content.annotations ?? [])
                 case "refusal": return content.refusal
                 default: return nil
                 }
             }.joined(separator: "\n")
         return .text(text.isEmpty ? "응답을 생성하지 못했습니다." : text)
     }
+}
+
+func renderCitations(in text: String, citations: [WebCitation]) -> String {
+    var markdown = text
+    var fallback: [WebCitation] = []
+    var upperBound = text.utf16.count
+
+    for citation in citations.filter({ $0.type == "url_citation" }).sorted(by: {
+        ($0.startIndex ?? -1) > ($1.startIndex ?? -1)
+    }) {
+        guard let startOffset = citation.startIndex,
+              let endOffset = citation.endIndex,
+              let url = citation.url,
+              isSafeWebURL(url),
+              0 <= startOffset,
+              startOffset < endOffset,
+              endOffset <= upperBound else {
+            fallback.append(citation)
+            continue
+        }
+
+        let utf16 = markdown.utf16
+        let startUTF16 = utf16.index(utf16.startIndex, offsetBy: startOffset)
+        let endUTF16 = utf16.index(utf16.startIndex, offsetBy: endOffset)
+        guard let start = String.Index(startUTF16, within: markdown),
+              let end = String.Index(endUTF16, within: markdown) else {
+            fallback.append(citation)
+            continue
+        }
+        markdown.replaceSubrange(start..<end, with: "[출처](\(url))")
+        upperBound = startOffset
+    }
+
+    let sources = fallback.reduce(into: [(title: String, url: String)]()) { sources, citation in
+        guard let url = citation.url,
+              isSafeWebURL(url),
+              !sources.contains(where: { $0.url == url }) else { return }
+        let title = ((citation.title?.isEmpty == false ? citation.title : nil) ?? "출처")
+            .replacingOccurrences(of: "[", with: "\\[")
+            .replacingOccurrences(of: "]", with: "\\]")
+            .replacingOccurrences(of: "\n", with: " ")
+        sources.append((title, url))
+    }
+    guard !sources.isEmpty else { return markdown }
+    return markdown + "\n\n### 출처\n" + sources.map { "- [\($0.title)](\($0.url))" }.joined(separator: "\n")
+}
+
+private func isSafeWebURL(_ string: String) -> Bool {
+    guard let scheme = URL(string: string)?.scheme?.lowercased() else { return false }
+    return scheme == "http" || scheme == "https"
 }

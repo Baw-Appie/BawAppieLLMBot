@@ -11,6 +11,7 @@ export TELEGRAM_WEBHOOK_SECRET="your-webhook-secret"
 export TELEGRAM_WEBHOOK_URL="https://example.com/telegram/webhook"
 export OPENAI_API_KEY="your-openai-api-key"
 export OPENAI_MODEL="gpt-5-mini"
+export OPENAI_IMAGE_MODEL="gpt-image-2.5-flare"
 ```
 
 `OPENAI_MODEL` is optional and defaults to `gpt-5.6-luna`.

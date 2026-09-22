@@ -7,8 +7,10 @@ struct TelegramWebhookResponse: Content {
 
 struct TelegramRouteController: RouteCollection {
     let model = Environment.get("OPENAI_MODEL") ?? "gpt-5.6-luna"
+    let imageModel = Environment.get("OPENAI_IMAGE_MODEL") ?? "gpt-image-2.5-flare"
     let openAI: OpenAI
     let telegramAPI: TelegramAPI
+    private let generatedImages = GeneratedImageStore()
     
     init() throws {
         openAI = OpenAI(apiKey: try requiredEnvironment("OPENAI_API_KEY"))
@@ -17,13 +19,26 @@ struct TelegramRouteController: RouteCollection {
             token: try requiredEnvironment("TELEGRAM_BOT_TOKEN")
         )
     }
-    
+
     func boot(routes: any RoutesBuilder) throws {
         let route = routes.grouped("telegram")
 
         route.get("register", use: registerWebhook)
         route.get("unregister", use: unregisterWebhook)
         route.on(.POST, "webhook", body: .collect(maxSize: "10mb"), use: processWebhook)
+        route.get("images", ":id", use: generatedImage)
+    }
+
+    private func generatedImage(req: Request) async throws -> Response {
+        guard let id = req.parameters.get("id"),
+              let image = await generatedImages.image(for: id) else {
+            throw Abort(.notFound)
+        }
+        let response = Response(status: .ok, body: .init(data: image))
+        response.headers.replaceOrAdd(name: .contentType, value: "image/jpeg")
+        response.headers.replaceOrAdd(name: .cacheControl, value: "no-store")
+        response.headers.replaceOrAdd(name: "X-Content-Type-Options", value: "nosniff")
+        return response
     }
 
     func processWebhook(req: Request) async throws -> TelegramWebhookResponse {
@@ -83,7 +98,7 @@ struct TelegramRouteController: RouteCollection {
 
         let draftId = max(message.messageId, 1)
         var lastFlush = Date.distantPast
-        let fullText = try await openAI.generateAIText(userText, model: model, httpClient: req.application.http.client.shared) { partialText in
+        let reply = try await openAI.generateReply(userText, model: model, httpClient: req.application.http.client.shared) { partialText in
             let now = Date()
             guard now.timeIntervalSince(lastFlush) >= 2.5 else { return }
             try? await telegramAPI.callTelegram(
@@ -96,6 +111,12 @@ struct TelegramRouteController: RouteCollection {
                 )
             )
             lastFlush = now
+        }
+        guard case .text(let fullText) = reply else {
+            if case .image(let prompt) = reply {
+                try await handleImage(prompt, message: message, req: req)
+            }
+            return
         }
         let markdown = safeRichMarkdown(fullText)
 
@@ -118,13 +139,54 @@ struct TelegramRouteController: RouteCollection {
         )
     }
 
+    private func handleImage(_ prompt: String, message: TelegramMessage, req: Request) async throws {
+        try await sendImageStatus("이미지를 생성하고 있습니다. 최대 몇 분 정도 걸릴 수 있습니다.", message: message)
+        do {
+            let image = try await openAI.generateImage(
+                prompt,
+                model: imageModel,
+                httpClient: req.application.http.client.shared
+            )
+            try? await telegramAPI.callTelegram(
+                "sendChatAction",
+                payload: SendChatActionRequest(
+                    chatId: message.chat.id,
+                    action: "upload_photo",
+                    messageThreadId: message.messageThreadId
+                )
+            )
+            try await telegramAPI.sendPhoto(
+                image,
+                chatId: message.chat.id,
+                messageThreadId: message.messageThreadId,
+                replyToMessageId: message.messageId
+            )
+        } catch {
+            req.logger.report(error: error)
+            try await sendImageStatus("이미지를 생성하거나 전송하지 못했습니다. 잠시 후 다시 시도해 주세요.", message: message)
+        }
+    }
+
+    private func sendImageStatus(_ text: String, message: TelegramMessage) async throws {
+        try await telegramAPI.callTelegram(
+            "sendRichMessage",
+            payload: SendRichMessageRequest(
+                chatId: message.chat.id,
+                richMessage: .init(markdown: text),
+                messageThreadId: message.messageThreadId
+            )
+        )
+    }
+
     private func handleGuestMessage(_ message: TelegramMessage, req: Request) async throws {
         guard let guestQueryId = message.guestQueryId else {
             req.logger.warning("Guest message does not include guest_query_id")
             return
         }
 
-        try await telegramAPI.callTelegram(
+        guard let userText = message.text, !userText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        // Answer promptly, then edit this inline message when generation finishes.
+        let sent = try await telegramAPI.callTelegram(
             "answerGuestQuery",
             payload: AnswerGuestQueryRequest(
                 guestQueryId: guestQueryId,
@@ -132,13 +194,52 @@ struct TelegramRouteController: RouteCollection {
                     id: UUID().uuidString,
                     title: "답변",
                     inputMessageContent: .init(
-                        richMessage: .init(markdown: safeRichMarkdown(try await openAI.generateAIText(
-                            message.text ?? "",
-                            model: model, 
-                            httpClient: req.application.http.client.shared
-                        )))
+                        richMessage: .init(markdown: "생각하고 있습니다…")
                     )
                 )
+            ),
+            returning: SentGuestMessage.self
+        )
+
+        do {
+            let reply = try await openAI.generateReply(
+                userText, model: model, httpClient: req.application.http.client.shared
+            )
+            switch reply {
+            case .text(let text):
+                try await editGuestText(text, inlineMessageId: sent.inlineMessageId)
+            case .image(let prompt):
+                try await editGuestText("이미지를 생성하고 있습니다…", inlineMessageId: sent.inlineMessageId)
+                let baseURL = try GeneratedImageStore.baseURL(webhookURL: requiredEnvironment("TELEGRAM_WEBHOOK_URL"))
+                let image = try await openAI.generateImage(
+                    prompt, model: imageModel, httpClient: req.application.http.client.shared
+                )
+                let id = try await generatedImages.insert(image)
+                do {
+                    try await telegramAPI.callTelegram(
+                        "editMessageMedia",
+                        payload: EditGuestPhotoRequest(
+                            inlineMessageId: sent.inlineMessageId,
+                            media: .init(media: baseURL.appendingPathComponent(id).absoluteString)
+                        )
+                    )
+                } catch {
+                    await generatedImages.remove(id)
+                    throw error
+                }
+            }
+        } catch {
+            req.logger.report(error: error)
+            try await editGuestText("답변을 생성하거나 전송하지 못했습니다. 잠시 후 다시 시도해 주세요.", inlineMessageId: sent.inlineMessageId)
+        }
+    }
+
+    private func editGuestText(_ text: String, inlineMessageId: String) async throws {
+        try await telegramAPI.callTelegram(
+            "editMessageText",
+            payload: EditGuestTextRequest(
+                inlineMessageId: inlineMessageId,
+                richMessage: .init(markdown: safeRichMarkdown(text))
             )
         )
     }
@@ -262,5 +363,30 @@ private struct AnswerGuestQueryRequest: Content {
     enum CodingKeys: String, CodingKey {
         case guestQueryId = "guest_query_id"
         case result
+    }
+}
+
+private struct EditGuestTextRequest: Content {
+    let inlineMessageId: String
+    let richMessage: InputRichMessage
+
+    enum CodingKeys: String, CodingKey {
+        case inlineMessageId = "inline_message_id"
+        case richMessage = "rich_message"
+    }
+}
+
+private struct EditGuestPhotoRequest: Encodable, Sendable {
+    struct Media: Encodable, Sendable {
+        let type = "photo"
+        let media: String
+    }
+
+    let inlineMessageId: String
+    let media: Media
+
+    enum CodingKeys: String, CodingKey {
+        case inlineMessageId = "inline_message_id"
+        case media
     }
 }

@@ -37,28 +37,12 @@ struct OpenAI {
     
     func generateReply(
         _ userText: String,
+        history: [ConversationMessage] = [],
         model: String,
         httpClient: HTTPClient,
         onPartialText: ((String) async -> Void)? = nil,
     ) async throws -> OpenAIReply {
-        let body = try JSONEncoder().encode(ResponsesRequest(
-            input: [
-                .init(
-                    role: "developer",
-                    content: "You are BawAppieLLMBot, a helpful Telegram assistant. " +
-                        "Answer kindly and politely in Korean using Telegram Rich Markdown, which follows " +
-                        "GitHub Flavored Markdown. Use headings, lists, tables, blockquotes, fenced code blocks, " +
-                        "and LaTeX formulas when useful. Use tables only when they make structured information clearer. " +
-                        "When the user asks you to draw or generate an image (for example, '고양이 그려줘'), " +
-                        "call generate_image with a self-contained prompt preserving their requested details. " +
-                        "No special command is needed. Do not call it for questions about images, requests for " +
-                        "drawing instructions or code, quoted examples, or requests not to generate an image. " +
-                        "If the subject is unclear, ask a short clarification. Generate at most one image."
-                ),
-                .init(role: "user", content: userText)
-            ],
-            model: model
-        ))
+        let body = try replyRequestBody(userText, history: history, model: model)
         var request = HTTPClientRequest(url: "\(apiUrl)/v1/responses")
         request.method = .POST
         request.headers.add(name: "Authorization", value: "Bearer \(apiKey)")
@@ -126,6 +110,28 @@ struct OpenAI {
         }
 
         throw OpenAIError.DecodeFailure("OpenAI responses: stream ended before response.completed")
+    }
+
+    func replyRequestBody(_ userText: String, history: [ConversationMessage], model: String) throws -> Data {
+        try JSONEncoder().encode(ResponsesRequest(
+            input: [
+                .init(
+                    role: "developer",
+                    content: "You are BawAppieLLMBot, a helpful Telegram assistant. " +
+                        "Answer kindly and politely in Korean using Telegram Rich Markdown, which follows " +
+                        "GitHub Flavored Markdown. Use headings, lists, tables, blockquotes, fenced code blocks, " +
+                        "and LaTeX formulas when useful. Use tables only when they make structured information clearer. " +
+                        "When the user asks you to draw or generate an image (for example, '고양이 그려줘'), " +
+                        "call generate_image with a self-contained prompt preserving their requested details. " +
+                        "No special command is needed. Do not call it for questions about images, requests for " +
+                        "drawing instructions or code, quoted examples, or requests not to generate an image. " +
+                        "If the subject is unclear, ask a short clarification. Generate at most one image."
+                )
+            ] + history.map { .init(role: $0.role.rawValue, content: $0.content) } + [
+                .init(role: "user", content: userText)
+            ],
+            model: model
+        ))
     }
 
     private func decodeStreamEvent(_ data: String, decoder: JSONDecoder) throws -> ResponsesStreamEvent {

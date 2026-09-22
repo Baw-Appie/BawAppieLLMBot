@@ -1,5 +1,5 @@
 {
-  "originHash" : "53c65d7fb9fefc6bb1bc6ba40782f0a6988fe3780884a7ee2ddbd9f03c00fb0c",
+  "originHash" : "7b48dd853c449af647b8ddf742063f0aa94f0ac9c7796bc1481f3eb03a8dad61",
   "pins" : [
     {
       "identity" : "alamofire",
@@ -53,6 +53,15 @@
       "state" : {
         "revision" : "1a10ccea61e4248effd23b6e814999ce7bdf0ee0",
         "version" : "4.9.3"
+      }
+    },
+    {
+      "identity" : "sqlite-nio",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/vapor/sqlite-nio.git",
+      "state" : {
+        "revision" : "553a6be0e228085b4d5e7c7ecb6a590186c31136",
+        "version" : "1.13.0"
       }
     },
     {

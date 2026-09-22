@@ -14,6 +14,7 @@ let package = Package(
         // HTTP Networking
         .package(url: "https://github.com/Alamofire/Alamofire.git", from: "5.12.0"),
         .package(url: "https://github.com/swift-server/async-http-client.git", from: "1.36.0"),
+        .package(url: "https://github.com/vapor/sqlite-nio.git", from: "1.11.0"),
     ],
     targets: [
         .executableTarget(
@@ -24,6 +25,7 @@ let package = Package(
                 .product(name: "NIOPosix", package: "swift-nio"),
                 .product(name: "Alamofire", package: "Alamofire"),
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
+                .product(name: "SQLiteNIO", package: "sqlite-nio"),
             ],
             swiftSettings: swiftSettings
         ),

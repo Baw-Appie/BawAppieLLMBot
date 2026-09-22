@@ -5,6 +5,8 @@ xcuserdata
 DerivedData/
 .DS_Store
 db.sqlite
+db.sqlite-wal
+db.sqlite-shm
 .swiftpm
 .env
 .env.*
@@ -12,4 +14,3 @@ db.sqlite
 default.profraw
 
 push.sh
-

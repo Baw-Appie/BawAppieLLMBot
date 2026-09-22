@@ -11,8 +11,11 @@ struct TelegramRouteController: RouteCollection {
     let openAI: OpenAI
     let telegramAPI: TelegramAPI
     private let generatedImages = GeneratedImageStore()
+    private let conversations: ConversationStore
+    private let conversationQueue = ConversationQueue()
     
-    init() throws {
+    init(conversations: ConversationStore) throws {
+        self.conversations = conversations
         openAI = OpenAI(apiKey: try requiredEnvironment("OPENAI_API_KEY"))
         telegramAPI = TelegramAPI(
             apiUrl: Environment.get("TELEGRAM_API_ENDPOINT"),
@@ -80,12 +83,20 @@ struct TelegramRouteController: RouteCollection {
         if let message = update.guestMessage {
             try await handleGuestMessage(message, req: req)
         } else if let message = update.message {
-            try await handleMessage(message, req: req)
+            try await conversationQueue.withLock(message.conversationKey.storageKey) {
+                try await handleMessage(message, req: req)
+            }
         }
     }
 
     private func handleMessage(_ message: TelegramMessage, req: Request) async throws {
-        guard let userText = message.text, !userText.isEmpty else { return }
+        guard let userText = message.text, !userText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        if isResetCommand(userText) {
+            try await conversations.reset(message.conversationKey)
+            try await sendImageStatus("이 대화의 기억을 초기화했습니다.", message: message)
+            return
+        }
+        let history = try await conversations.history(for: message.conversationKey)
 
         try await telegramAPI.callTelegram(
             "sendChatAction",
@@ -98,7 +109,7 @@ struct TelegramRouteController: RouteCollection {
 
         let draftId = max(message.messageId, 1)
         var lastFlush = Date.distantPast
-        let reply = try await openAI.generateReply(userText, model: model, httpClient: req.application.http.client.shared) { partialText in
+        let reply = try await openAI.generateReply(userText, history: history, model: model, httpClient: req.application.http.client.shared) { partialText in
             let now = Date()
             guard now.timeIntervalSince(lastFlush) >= 2.5 else { return }
             try? await telegramAPI.callTelegram(
@@ -137,6 +148,7 @@ struct TelegramRouteController: RouteCollection {
                 messageThreadId: message.messageThreadId
             )
         )
+        await remember(user: userText, assistant: markdown, message: message, req: req)
     }
 
     private func handleImage(_ prompt: String, message: TelegramMessage, req: Request) async throws {
@@ -160,6 +172,11 @@ struct TelegramRouteController: RouteCollection {
                 chatId: message.chat.id,
                 messageThreadId: message.messageThreadId,
                 replyToMessageId: message.messageId
+            )
+            await remember(
+                user: message.text ?? prompt,
+                assistant: "이미지를 생성해 전송했습니다. 생성 프롬프트: \(prompt)",
+                message: message, req: req
             )
         } catch {
             req.logger.report(error: error)
@@ -202,35 +219,63 @@ struct TelegramRouteController: RouteCollection {
         )
 
         do {
-            let reply = try await openAI.generateReply(
-                userText, model: model, httpClient: req.application.http.client.shared
-            )
-            switch reply {
-            case .text(let text):
-                try await editGuestText(text, inlineMessageId: sent.inlineMessageId)
-            case .image(let prompt):
-                try await editGuestText("이미지를 생성하고 있습니다…", inlineMessageId: sent.inlineMessageId)
-                let baseURL = try GeneratedImageStore.baseURL(webhookURL: requiredEnvironment("TELEGRAM_WEBHOOK_URL"))
-                let image = try await openAI.generateImage(
-                    prompt, model: imageModel, httpClient: req.application.http.client.shared
-                )
-                let id = try await generatedImages.insert(image)
-                do {
-                    try await telegramAPI.callTelegram(
-                        "editMessageMedia",
-                        payload: EditGuestPhotoRequest(
-                            inlineMessageId: sent.inlineMessageId,
-                            media: .init(media: baseURL.appendingPathComponent(id).absoluteString)
-                        )
-                    )
-                } catch {
-                    await generatedImages.remove(id)
-                    throw error
-                }
+            try await conversationQueue.withLock(message.conversationKey.storageKey) {
+                try await completeGuestMessage(message, userText: userText, sent: sent, req: req)
             }
         } catch {
             req.logger.report(error: error)
             try await editGuestText("답변을 생성하거나 전송하지 못했습니다. 잠시 후 다시 시도해 주세요.", inlineMessageId: sent.inlineMessageId)
+        }
+    }
+
+    private func completeGuestMessage(
+        _ message: TelegramMessage, userText: String, sent: SentGuestMessage, req: Request
+    ) async throws {
+        if isResetCommand(userText) {
+            try await conversations.reset(message.conversationKey)
+            try await editGuestText("이 대화의 기억을 초기화했습니다.", inlineMessageId: sent.inlineMessageId)
+            return
+        }
+        let history = try await conversations.history(for: message.conversationKey)
+        let reply = try await openAI.generateReply(
+            userText, history: history, model: model, httpClient: req.application.http.client.shared
+        )
+        let rememberedReply: String
+        switch reply {
+        case .text(let text):
+            try await editGuestText(text, inlineMessageId: sent.inlineMessageId)
+            rememberedReply = safeRichMarkdown(text)
+        case .image(let prompt):
+            try await editGuestText("이미지를 생성하고 있습니다…", inlineMessageId: sent.inlineMessageId)
+            let baseURL = try GeneratedImageStore.baseURL(webhookURL: requiredEnvironment("TELEGRAM_WEBHOOK_URL"))
+            let image = try await openAI.generateImage(
+                prompt, model: imageModel, httpClient: req.application.http.client.shared
+            )
+            let id = try await generatedImages.insert(image)
+            do {
+                try await telegramAPI.callTelegram(
+                    "editMessageMedia",
+                    payload: EditGuestPhotoRequest(
+                        inlineMessageId: sent.inlineMessageId,
+                        media: .init(media: baseURL.appendingPathComponent(id).absoluteString)
+                    )
+                )
+            } catch {
+                await generatedImages.remove(id)
+                throw error
+            }
+            rememberedReply = "이미지를 생성해 전송했습니다. 생성 프롬프트: \(prompt)"
+        }
+        await remember(user: userText, assistant: rememberedReply, message: message, req: req)
+    }
+
+    private func remember(user: String, assistant: String, message: TelegramMessage, req: Request) async {
+        do {
+            try await conversations.append(user: user, assistant: assistant, for: message.conversationKey)
+        } catch {
+            // A persistence failure must not replace an already delivered answer with an error.
+            req.logger.error("Failed to save conversation history")
+            req.logger.report(error: error)
         }
     }
 
@@ -250,6 +295,10 @@ struct TelegramRouteController: RouteCollection {
     }
 }
 
+func isResetCommand(_ text: String) -> Bool {
+    text.trimmingCharacters(in: .whitespacesAndNewlines) == "/reset"
+}
+
 private struct TelegramUpdate: Content {
     let message: TelegramMessage?
     let guestMessage: TelegramMessage?
@@ -266,6 +315,8 @@ private struct TelegramMessage: Content {
     let messageThreadId: Int?
     let guestQueryId: String?
     let text: String?
+
+    var conversationKey: ConversationKey { .init(chatID: chat.id, threadID: messageThreadId) }
 
     enum CodingKeys: String, CodingKey {
         case messageId = "message_id"

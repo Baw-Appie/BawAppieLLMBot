@@ -1,7 +1,7 @@
 import Vapor
 
-func routes(_ app: Application) throws {
-    try app.register(collection: TelegramRouteController())
+func routes(_ app: Application, conversations: ConversationStore) throws {
+    try app.register(collection: TelegramRouteController(conversations: conversations))
 
     app.get { req async in
         "It works!"

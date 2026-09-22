@@ -157,7 +157,7 @@ struct OpenAI {
         let input: [Message]
         let model: String
         let stream = true
-        let store = false
+        let store = true
         let tools: [ResponsesTool] = [
             .webSearch(WebSearchTool()),
             .imageGeneration(ImageGenerationTool())

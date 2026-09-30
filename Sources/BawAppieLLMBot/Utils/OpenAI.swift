@@ -6,6 +6,18 @@ import NIOHTTP1
 enum OpenAIError: Error {
     case RequestFailure(String)
     case DecodeFailure(String)
+
+    /// The human readable reason, used to report the failure back to the chat.
+    var message: String {
+        switch self {
+        case .RequestFailure(let message), .DecodeFailure(let message):
+            return message
+        }
+    }
+}
+
+extension OpenAIError: LocalizedError {
+    var errorDescription: String? { message }
 }
 
 struct OpenAI {
@@ -21,12 +33,7 @@ struct OpenAI {
 
         let response = try await httpClient.execute(request, timeout: .seconds(180))
         guard response.status == .ok else {
-            var body = try await response.body.collect(upTo: 1_048_576)
-            let bytes = body.readBytes(length: body.readableBytes) ?? []
-            let apiError = try? JSONDecoder().decode(OpenAIErrorResponse.self, from: Data(bytes))
-            throw OpenAIError.RequestFailure(
-                "OpenAI image generation: \(apiError?.error.message ?? "HTTP \(response.status.code)")"
-            )
+            throw await requestFailure(response, context: "OpenAI image generation")
         }
 
         // Allow for Base64 overhead while keeping the response bounded.
@@ -52,11 +59,7 @@ struct OpenAI {
 
         let response = try await httpClient.execute(request, timeout: .seconds(180))
         guard response.status == .ok else {
-            var errorBody = try await response.body.collect(upTo: 1_048_576)
-            let bytes = errorBody.readBytes(length: errorBody.readableBytes) ?? []
-            let apiError = try? JSONDecoder().decode(OpenAIErrorResponse.self, from: Data(bytes))
-            let reason = apiError?.error.message ?? "OpenAI API request failed (\(response.status.code))"
-            throw OpenAIError.RequestFailure("OpenAI responses: \(reason)")
+            throw await requestFailure(response, context: "OpenAI responses")
         }
 
         var partialText = ""
@@ -93,9 +96,7 @@ struct OpenAI {
                         }
                         return try completed.reply()
                     case "response.failed", "response.incomplete", "error":
-                        let reason = event.response?.error?.message ?? event.message
-                            ?? event.response?.incompleteDetails?.reason ?? event.type
-                        throw OpenAIError.RequestFailure("OpenAI responses: \(reason)")
+                        throw OpenAIError.RequestFailure("OpenAI responses: \(event.failureDetail)")
                     default:
                         break
                     }
@@ -136,15 +137,31 @@ struct OpenAI {
         ))
     }
 
-    private func decodeStreamEvent(_ data: String, decoder: JSONDecoder) throws -> ResponsesStreamEvent {
-        let data = Data(data.utf8)
+    /// Reads the error body so the caller can report OpenAI's own message instead of a generic failure.
+    private func requestFailure(_ response: HTTPClientResponse, context: String) async -> OpenAIError {
+        let body = try? await response.body.collect(upTo: 1_048_576)
+        var buffer = body ?? ByteBufferAllocator().buffer(capacity: 0)
+        let bytes = buffer.readBytes(length: buffer.readableBytes) ?? []
+        let data = Data(bytes)
+        if let apiError = try? JSONDecoder().decode(OpenAIErrorResponse.self, from: data) {
+            return .RequestFailure("\(context) (HTTP \(response.status.code)): \(apiError.error.detail)")
+        }
+        let raw = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return .RequestFailure("\(context): HTTP \(response.status.code)") }
+        return .RequestFailure("\(context) (HTTP \(response.status.code)): \(String(raw.prefix(1_000)))")
+    }
+
+    private func decodeStreamEvent(_ data: String, decoder: JSONDecoder) throws -> ResponsesStreamEvent {        let data = Data(data.utf8)
         do {
             return try decoder.decode(ResponsesStreamEvent.self, from: data)
         } catch {
             if let apiError = try? decoder.decode(OpenAIErrorResponse.self, from: data) {
-                throw OpenAIError.DecodeFailure("OpenAI responses: \(apiError.error.message)")
+                throw OpenAIError.RequestFailure("OpenAI responses: \(apiError.error.detail)")
             }
-            throw error
+            let raw = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            throw OpenAIError.DecodeFailure(
+                "OpenAI responses: undecodable stream event: \(String(raw.prefix(1_000)))"
+            )
         }
     }
 
@@ -173,6 +190,16 @@ struct OpenAI {
     private struct OpenAIErrorResponse: Decodable {
         struct APIError: Decodable {
             let message: String
+            let type: String?
+            let code: String?
+            let param: String?
+
+            /// Message plus any identifying fields OpenAI returned, for actionable reports.
+            var detail: String {
+                let extras = [type, code, param].compactMap { $0?.isEmpty == false ? $0 : nil }
+                guard !extras.isEmpty else { return message }
+                return "\(message) [\(extras.joined(separator: ", "))]"
+            }
         }
 
         let error: APIError
@@ -266,6 +293,21 @@ private struct ResponsesStreamEvent: Decodable {
     let item: ResponsesOutputItem?
     let response: ResponsesResult?
     let message: String?
+    let code: String?
+    let param: String?
+
+    /// Everything the event tells us about why generation stopped.
+    var failureDetail: String {
+        var parts: [String] = []
+        if let message = response?.error?.detail ?? message, !message.isEmpty { parts.append(message) }
+        if let reason = response?.incompleteDetails?.reason, !reason.isEmpty {
+            parts.append("incomplete: \(reason)")
+        }
+        for extra in [code, param] where extra?.isEmpty == false {
+            parts.append(extra!)
+        }
+        return parts.isEmpty ? type : "\(type): \(parts.joined(separator: " | "))"
+    }
 }
 
 struct ResponsesOutputItem: Decodable {
@@ -300,6 +342,12 @@ struct WebCitation: Decodable {
 struct ResponsesResult: Decodable {
     struct APIError: Decodable {
         let message: String
+        let code: String?
+
+        var detail: String {
+            guard let code, !code.isEmpty else { return message }
+            return "\(message) [\(code)]"
+        }
     }
 
     struct IncompleteDetails: Decodable {
@@ -318,7 +366,10 @@ struct ResponsesResult: Decodable {
 
     func reply() throws -> OpenAIReply {
         guard status == "completed", error == nil else {
-            throw OpenAIError.RequestFailure("OpenAI responses: \(error?.message ?? status)")
+            var parts = [error?.detail, incompleteDetails.map { "incomplete: \($0.reason)" }]
+                .compactMap { $0?.isEmpty == false ? $0 : nil }
+            if parts.isEmpty { parts.append("status \(status)") }
+            throw OpenAIError.RequestFailure("OpenAI responses: \(parts.joined(separator: " | "))")
         }
         let toolCalls = output.filter { $0.type == "function_call" }
         if let call = toolCalls.first {

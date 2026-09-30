@@ -109,19 +109,26 @@ struct TelegramRouteController: RouteCollection {
 
         let draftId = max(message.messageId, 1)
         var lastFlush = Date.distantPast
-        let reply = try await openAI.generateReply(userText, history: history, model: model, httpClient: req.application.http.client.shared) { partialText in
-            let now = Date()
-            guard now.timeIntervalSince(lastFlush) >= 2.5 else { return }
-            try? await telegramAPI.callTelegram(
-                "sendRichMessageDraft",
-                payload: SendRichMessageDraftRequest(
-                    chatId: message.chat.id,
-                    draftId: draftId,
-                    richMessage: .init(markdown: safeRichMarkdown(partialText)),
-                    messageThreadId: message.messageThreadId
+        let reply: OpenAIReply
+        do {
+            reply = try await openAI.generateReply(userText, history: history, model: model, httpClient: req.application.http.client.shared) { partialText in
+                let now = Date()
+                guard now.timeIntervalSince(lastFlush) >= 2.5 else { return }
+                try? await telegramAPI.callTelegram(
+                    "sendRichMessageDraft",
+                    payload: SendRichMessageDraftRequest(
+                        chatId: message.chat.id,
+                        draftId: draftId,
+                        richMessage: .init(markdown: safeRichMarkdown(partialText)),
+                        messageThreadId: message.messageThreadId
+                    )
                 )
-            )
-            lastFlush = now
+                lastFlush = now
+            }
+        } catch {
+            req.logger.report(error: error)
+            try await sendImageStatus(errorReport(error), message: message)
+            return
         }
         guard case .text(let fullText) = reply else {
             if case .image(let prompt) = reply {
@@ -180,7 +187,7 @@ struct TelegramRouteController: RouteCollection {
             )
         } catch {
             req.logger.report(error: error)
-            try await sendImageStatus("이미지를 생성하거나 전송하지 못했습니다. 잠시 후 다시 시도해 주세요.", message: message)
+            try await sendImageStatus(errorReport(error), message: message)
         }
     }
 
@@ -224,7 +231,7 @@ struct TelegramRouteController: RouteCollection {
             }
         } catch {
             req.logger.report(error: error)
-            try await editGuestText("답변을 생성하거나 전송하지 못했습니다. 잠시 후 다시 시도해 주세요.", inlineMessageId: sent.inlineMessageId)
+            try await editGuestText(errorReport(error), inlineMessageId: sent.inlineMessageId)
         }
     }
 
@@ -293,6 +300,26 @@ struct TelegramRouteController: RouteCollection {
         let text = String(text.prefix(32_768))
         return text.isEmpty ? "응답을 생성하지 못했습니다." : text
     }
+}
+
+/// Renders a failure so the chat shows the upstream error text instead of a generic apology.
+func errorReport(_ error: any Error) -> String {
+    let detail: String
+    switch error {
+    case let error as OpenAIError:
+        detail = error.message
+    case let error as TelegramAPIError:
+        detail = error.message
+    case let error as any LocalizedError:
+        detail = error.errorDescription ?? String(describing: error)
+    default:
+        detail = String(describing: error)
+    }
+    let trimmed = detail.trimmingCharacters(in: .whitespacesAndNewlines)
+    let message = trimmed.isEmpty ? String(describing: error) : trimmed
+    // Keep the fenced block intact even when the upstream text contains backticks.
+    let fenced = String(message.prefix(3_000)).replacingOccurrences(of: "`", with: "'")
+    return "요청을 처리하지 못했습니다.\n\n```\n\(fenced)\n```"
 }
 
 func isResetCommand(_ text: String) -> Bool {

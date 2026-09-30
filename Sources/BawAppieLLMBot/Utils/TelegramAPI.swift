@@ -3,6 +3,16 @@ import Foundation
 
 enum TelegramAPIError : Error {
     case RequestFailure(String)
+
+    var message: String {
+        switch self {
+        case .RequestFailure(let message): return message
+        }
+    }
+}
+
+extension TelegramAPIError: LocalizedError {
+    var errorDescription: String? { message }
 }
 
 struct TelegramAPI {

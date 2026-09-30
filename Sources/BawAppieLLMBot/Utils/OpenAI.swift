@@ -151,9 +151,13 @@ struct OpenAI {
         return .RequestFailure("\(context) (HTTP \(response.status.code)): \(String(raw.prefix(1_000)))")
     }
 
-    private func decodeStreamEvent(_ data: String, decoder: JSONDecoder) throws -> ResponsesStreamEvent {        let data = Data(data.utf8)
+    private func decodeStreamEvent(_ data: String, decoder: JSONDecoder) throws -> ResponsesStreamEvent {
+        let raw = data
+        let data = Data(data.utf8)
         do {
-            return try decoder.decode(ResponsesStreamEvent.self, from: data)
+            var event = try decoder.decode(ResponsesStreamEvent.self, from: data)
+            event.rawPayload = raw
+            return event
         } catch {
             if let apiError = try? decoder.decode(OpenAIErrorResponse.self, from: data) {
                 throw OpenAIError.RequestFailure("OpenAI responses: \(apiError.error.detail)")
@@ -287,24 +291,38 @@ private struct ImageGenerationTool: Encodable {
     }
 }
 
-private struct ResponsesStreamEvent: Decodable {
+struct ResponsesStreamEvent: Decodable {
     let type: String
     let delta: String?
     let item: ResponsesOutputItem?
     let response: ResponsesResult?
+    /// Top level error object of an `error` event, which carries the only detail that event has.
+    let error: ResponsesResult.APIError?
     let message: String?
     let code: String?
     let param: String?
+    /// Raw SSE payload, kept so a detail-less failure event still reports something actionable.
+    var rawPayload: String?
+
+    enum CodingKeys: String, CodingKey {
+        case type, delta, item, response, error, message, code, param
+    }
 
     /// Everything the event tells us about why generation stopped.
     var failureDetail: String {
         var parts: [String] = []
-        if let message = response?.error?.detail ?? message, !message.isEmpty { parts.append(message) }
+        if let detail = error?.detail ?? response?.error?.detail ?? message, !detail.isEmpty {
+            parts.append(detail)
+        }
         if let reason = response?.incompleteDetails?.reason, !reason.isEmpty {
             parts.append("incomplete: \(reason)")
         }
         for extra in [code, param] where extra?.isEmpty == false {
             parts.append(extra!)
+        }
+        if parts.isEmpty, let raw = rawPayload?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !raw.isEmpty {
+            parts.append(String(raw.prefix(1_000)))
         }
         return parts.isEmpty ? type : "\(type): \(parts.joined(separator: " | "))"
     }

@@ -47,6 +47,28 @@ struct ErrorReportTests {
         }
     }
 
+    private func streamEvent(_ payload: [String: Any]) throws -> ResponsesStreamEvent {
+        let data = try JSONSerialization.data(withJSONObject: payload)
+        var event = try JSONDecoder().decode(ResponsesStreamEvent.self, from: data)
+        event.rawPayload = String(decoding: data, as: UTF8.self)
+        return event
+    }
+
+    @Test("An error event surfaces its top level error object")
+    func errorEventDetail() throws {
+        let event = try streamEvent([
+            "type": "error",
+            "error": ["message": "Server had an error", "code": "server_error"]
+        ])
+        #expect(event.failureDetail == "error: Server had an error [server_error]")
+    }
+
+    @Test("A detail-less failure event falls back to the raw payload")
+    func errorEventFallback() throws {
+        let event = try streamEvent(["type": "error", "sequence_number": 3])
+        #expect(event.failureDetail.contains("sequence_number"))
+    }
+
     @Test("errorReport renders the upstream text in a fenced block")
     func reportFormatting() {
         let report = errorReport(OpenAIError.RequestFailure("OpenAI responses: bad `model`"))

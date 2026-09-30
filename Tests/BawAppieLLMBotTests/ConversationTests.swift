@@ -121,6 +121,43 @@ struct ConversationTests {
         #expect(tools.last?["name"] as? String == "generate_image")
     }
 
+    @Test("An attached image becomes an input_image content part alongside the caption")
+    func imageAttachmentInput() throws {
+        let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        let attachment = try ImageAttachment(mimeType: "image/PNG", data: png)
+        #expect(attachment.mimeType == "image/png")
+        #expect(attachment.dataURL == "data:image/png;base64,\(png.base64EncodedString())")
+
+        let body = try OpenAI(apiKey: "test").replyRequestBody(
+            "이거 뭔지 알려줘", attachments: [attachment], history: [], model: "test"
+        )
+        let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let input = try #require(json["input"] as? [[String: Any]])
+        #expect(input.count == 2)
+        let parts = try #require(input.last?["content"] as? [[String: Any]])
+        #expect(parts.map { $0["type"] as? String } == ["input_text", "input_image"])
+        #expect(parts.first?["text"] as? String == "이거 뭔지 알려줘")
+        #expect(parts.last?["image_url"] as? String == attachment.dataURL)
+        // Text-only turns must stay plain strings so existing history keeps working.
+        #expect(input.first?["content"] as? String != nil)
+    }
+
+    @Test("Unsupported types and oversized or empty payloads are rejected")
+    func imageAttachmentValidation() throws {
+        #expect(throws: OpenAIError.self) {
+            try ImageAttachment(mimeType: "image/heic", data: Data([0x01]))
+        }
+        #expect(throws: OpenAIError.self) {
+            try ImageAttachment(mimeType: "image/jpeg", data: Data())
+        }
+        #expect(throws: OpenAIError.self) {
+            try ImageAttachment(
+                mimeType: "image/jpeg",
+                data: Data(repeating: 0, count: ImageAttachment.maxBytes + 1)
+            )
+        }
+    }
+
     @Test("Web citations become clickable Telegram Markdown links")
     func webCitations() throws {
         let marker = "citeturn0search0"

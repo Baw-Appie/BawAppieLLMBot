@@ -44,6 +44,35 @@ struct TelegramAPI {
         }
     }
 
+    /// Resolves a `file_id` to a download path, then fetches the bytes.
+    /// Telegram's Bot API only serves files up to 20 MB through this route.
+    func downloadFile(fileId: String, maxBytes: Int) async throws -> Data {
+        let file = try await callTelegram(
+            "getFile", payload: GetFileRequest(fileId: fileId), returning: TelegramFile.self
+        )
+        if let size = file.fileSize, size > maxBytes {
+            throw TelegramAPIError.RequestFailure("Telegram getFile: file is larger than \(maxBytes) bytes")
+        }
+        guard let path = file.filePath, !path.isEmpty, !path.hasPrefix("/"), !path.contains("..") else {
+            throw TelegramAPIError.RequestFailure("Telegram getFile: missing usable file_path")
+        }
+        let escaped = path.split(separator: "/").map {
+            $0.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? String($0)
+        }.joined(separator: "/")
+        let response = await AF.request("\(apiUrl)/file/bot\(token)/\(escaped)")
+            .serializingData()
+            .response
+        guard let status = response.response?.statusCode, status == 200, let data = response.data else {
+            throw TelegramAPIError.RequestFailure(
+                "Telegram file download failed (HTTP \(response.response?.statusCode ?? 0))"
+            )
+        }
+        guard !data.isEmpty, data.count <= maxBytes else {
+            throw TelegramAPIError.RequestFailure("Telegram file download returned an unusable payload")
+        }
+        return data
+    }
+
     func sendPhoto(_ image: Data, chatId: Int64, messageThreadId: Int?, replyToMessageId: Int) async throws {
         let replyParameters = try JSONEncoder().encode(PhotoReplyParameters(messageId: replyToMessageId))
         let result = try await AF.upload(
@@ -83,6 +112,24 @@ struct TelegramAPI {
             throw TelegramAPIError.RequestFailure("Telegram \(method): \(response.errorDescription ?? "missing result")")
         }
         return result
+    }
+}
+
+private struct GetFileRequest: Encodable, Sendable {
+    let fileId: String
+
+    enum CodingKeys: String, CodingKey {
+        case fileId = "file_id"
+    }
+}
+
+struct TelegramFile: Decodable, Sendable {
+    let filePath: String?
+    let fileSize: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case filePath = "file_path"
+        case fileSize = "file_size"
     }
 }
 

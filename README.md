@@ -22,6 +22,17 @@ The bot can automatically use OpenAI Responses web search for current or
 time-sensitive questions and when the user explicitly asks it to search or verify
 something online. Search answers include clickable source links in Telegram.
 
+## Image understanding
+
+Send a photo, or an image as a file, and the bot answers about what it shows. The
+caption becomes the question; without one the bot describes the image. Supported
+formats are JPEG, PNG, GIF, and WebP, up to 15 MB. Telegram's Bot API does not serve
+files above 20 MB, so larger uploads fail with an error in the chat.
+
+Conversation memory stores text only. An image turn is remembered as
+`[이미지 N장 첨부]` plus the caption, not the image itself, so follow-up questions
+about an earlier image need the image sent again.
+
 ## Conversation memory
 
 The bot remembers the latest 20 successfully delivered question/answer pairs per

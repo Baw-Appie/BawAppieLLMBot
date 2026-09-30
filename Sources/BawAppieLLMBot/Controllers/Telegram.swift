@@ -90,12 +90,23 @@ struct TelegramRouteController: RouteCollection {
     }
 
     private func handleMessage(_ message: TelegramMessage, req: Request) async throws {
-        guard let userText = message.text, !userText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        if shouldResetContext(userText) {
+        let trimmedPrompt = message.prompt?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !trimmedPrompt.isEmpty || message.hasImage else { return }
+        if shouldResetContext(trimmedPrompt) {
             try await conversations.reset(message.conversationKey)
             try await sendImageStatus("이 대화의 기억을 초기화했습니다.", message: message)
             return
         }
+        let attachments: [ImageAttachment]
+        do {
+            attachments = try await imageAttachments(for: message)
+        } catch {
+            req.logger.report(error: error)
+            try await sendImageStatus(errorReport(error), message: message)
+            return
+        }
+        // An image with no caption still needs a prompt for the model to act on.
+        let userText = trimmedPrompt.isEmpty ? defaultImagePrompt(count: attachments.count) : trimmedPrompt
         let history = try await conversations.history(for: message.conversationKey)
 
         try await telegramAPI.callTelegram(
@@ -111,7 +122,7 @@ struct TelegramRouteController: RouteCollection {
         var lastFlush = Date.distantPast
         let reply: OpenAIReply
         do {
-            reply = try await openAI.generateReply(userText, history: history, model: model, httpClient: req.application.http.client.shared) { partialText in
+            reply = try await openAI.generateReply(userText, attachments: attachments, history: history, model: model, httpClient: req.application.http.client.shared) { partialText in
                 let now = Date()
                 guard now.timeIntervalSince(lastFlush) >= 2.5 else { return }
                 try? await telegramAPI.callTelegram(
@@ -155,7 +166,36 @@ struct TelegramRouteController: RouteCollection {
                 messageThreadId: message.messageThreadId
             )
         )
-        await remember(user: userText, assistant: markdown, message: message, req: req)
+        await remember(user: rememberedUserText(userText, attachments: attachments), assistant: markdown, message: message, req: req)
+    }
+
+    /// Downloads every image on the message, largest photo size first.
+    private func imageAttachments(for message: TelegramMessage) async throws -> [ImageAttachment] {
+        var attachments: [ImageAttachment] = []
+        if let photo = message.largestPhoto {
+            let data = try await telegramAPI.downloadFile(
+                fileId: photo.fileId, maxBytes: ImageAttachment.maxBytes
+            )
+            // Telegram always re-encodes `photo` uploads as JPEG.
+            attachments.append(try ImageAttachment(mimeType: "image/jpeg", data: data))
+        }
+        if let document = message.imageDocument, let mimeType = document.mimeType {
+            let data = try await telegramAPI.downloadFile(
+                fileId: document.fileId, maxBytes: ImageAttachment.maxBytes
+            )
+            attachments.append(try ImageAttachment(mimeType: mimeType, data: data))
+        }
+        return attachments
+    }
+
+    private func defaultImagePrompt(count: Int) -> String {
+        count > 1 ? "첨부한 이미지들을 설명해 주세요." : "첨부한 이미지를 설명해 주세요."
+    }
+
+    /// History stores text only, so note that images were part of the turn.
+    private func rememberedUserText(_ userText: String, attachments: [ImageAttachment]) -> String {
+        guard !attachments.isEmpty else { return userText }
+        return "[이미지 \(attachments.count)장 첨부] \(userText)"
     }
 
     private func handleImage(_ prompt: String, message: TelegramMessage, req: Request) async throws {
@@ -181,7 +221,7 @@ struct TelegramRouteController: RouteCollection {
                 replyToMessageId: message.messageId
             )
             await remember(
-                user: message.text ?? prompt,
+                user: message.prompt ?? prompt,
                 assistant: "이미지를 생성해 전송했습니다. 생성 프롬프트: \(prompt)",
                 message: message, req: req
             )
@@ -354,15 +394,51 @@ private struct TelegramMessage: Content {
     let messageThreadId: Int?
     let guestQueryId: String?
     let text: String?
+    let caption: String?
+    let photo: [TelegramPhotoSize]?
+    let document: TelegramDocument?
 
     var conversationKey: ConversationKey { .init(chatID: chat.id, threadID: messageThreadId) }
+
+    /// A caption travels with photos and documents, where `text` is always absent.
+    var prompt: String? { text ?? caption }
+
+    /// Telegram sends ascending thumbnail sizes; the last one is the original upload.
+    var largestPhoto: TelegramPhotoSize? { photo?.last }
+
+    /// Images sent as files keep their own MIME type, which must be one the model accepts.
+    var imageDocument: TelegramDocument? {
+        guard let document, let mimeType = document.mimeType?.lowercased(),
+              ImageAttachment.supportedMIMETypes.contains(mimeType) else { return nil }
+        return document
+    }
+
+    var hasImage: Bool { largestPhoto != nil || imageDocument != nil }
 
     enum CodingKeys: String, CodingKey {
         case messageId = "message_id"
         case chat
         case messageThreadId = "message_thread_id"
         case guestQueryId = "guest_query_id"
-        case text
+        case text, caption, photo, document
+    }
+}
+
+private struct TelegramPhotoSize: Content {
+    let fileId: String
+
+    enum CodingKeys: String, CodingKey {
+        case fileId = "file_id"
+    }
+}
+
+private struct TelegramDocument: Content {
+    let fileId: String
+    let mimeType: String?
+
+    enum CodingKeys: String, CodingKey {
+        case fileId = "file_id"
+        case mimeType = "mime_type"
     }
 }
 

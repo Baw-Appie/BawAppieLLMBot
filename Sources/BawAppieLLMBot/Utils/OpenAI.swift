@@ -44,12 +44,13 @@ struct OpenAI {
     
     func generateReply(
         _ userText: String,
+        attachments: [ImageAttachment] = [],
         history: [ConversationMessage] = [],
         model: String,
         httpClient: HTTPClient,
         onPartialText: ((String) async -> Void)? = nil,
     ) async throws -> OpenAIReply {
-        let body = try replyRequestBody(userText, history: history, model: model)
+        let body = try replyRequestBody(userText, attachments: attachments, history: history, model: model)
         var request = HTTPClientRequest(url: "\(apiUrl)/v1/responses")
         request.method = .POST
         request.headers.add(name: "Authorization", value: "Bearer \(apiKey)")
@@ -113,7 +114,12 @@ struct OpenAI {
         throw OpenAIError.DecodeFailure("OpenAI responses: stream ended before response.completed")
     }
 
-    func replyRequestBody(_ userText: String, history: [ConversationMessage], model: String) throws -> Data {
+    func replyRequestBody(
+        _ userText: String,
+        attachments: [ImageAttachment] = [],
+        history: [ConversationMessage],
+        model: String
+    ) throws -> Data {
         try JSONEncoder().encode(ResponsesRequest(
             input: [
                 .init(
@@ -128,10 +134,12 @@ struct OpenAI {
                         "drawing instructions or code, quoted examples, or requests not to generate an image. " +
                         "If the subject is unclear, ask a short clarification. Generate at most one image. " +
                         "Use web search when the user asks for current, recent, or otherwise time-sensitive information, " +
-                        "or explicitly asks you to search or verify something on the web."
+                        "or explicitly asks you to search or verify something on the web. " +
+                        "When the user attaches images, read them carefully and ground your answer in what they show. " +
+                        "Say so plainly if an image is unreadable or does not contain what the user expects."
                 )
             ] + history.map { .init(role: $0.role.rawValue, content: $0.content) } + [
-                .init(role: "user", content: userText)
+                .init(role: "user", text: userText, attachments: attachments)
             ],
             model: model
         ))
@@ -170,9 +178,61 @@ struct OpenAI {
     }
 
     private struct ResponsesRequest: Encodable {
+        /// Text-only turns stay plain strings; a turn with images becomes a content part array.
         struct Message: Encodable {
             let role: String
-            let content: String
+            let text: String
+            let attachments: [ImageAttachment]
+
+            init(role: String, content: String) {
+                self.init(role: role, text: content, attachments: [])
+            }
+
+            init(role: String, text: String, attachments: [ImageAttachment]) {
+                self.role = role
+                self.text = text
+                self.attachments = attachments
+            }
+
+            enum CodingKeys: String, CodingKey {
+                case role, content
+            }
+
+            func encode(to encoder: any Encoder) throws {
+                var container = encoder.container(keyedBy: CodingKeys.self)
+                try container.encode(role, forKey: .role)
+                guard !attachments.isEmpty else {
+                    try container.encode(text, forKey: .content)
+                    return
+                }
+                var parts = attachments.map { ContentPart.image($0.dataURL) }
+                if !text.isEmpty { parts.insert(.text(text), at: 0) }
+                try container.encode(parts, forKey: .content)
+            }
+        }
+
+        enum ContentPart: Encodable {
+            case text(String)
+            case image(String)
+
+            enum CodingKeys: String, CodingKey {
+                case type, text
+                case imageURL = "image_url"
+                case detail
+            }
+
+            func encode(to encoder: any Encoder) throws {
+                var container = encoder.container(keyedBy: CodingKeys.self)
+                switch self {
+                case .text(let text):
+                    try container.encode("input_text", forKey: .type)
+                    try container.encode(text, forKey: .text)
+                case .image(let url):
+                    try container.encode("input_image", forKey: .type)
+                    try container.encode(url, forKey: .imageURL)
+                    try container.encode("auto", forKey: .detail)
+                }
+            }
         }
 
         let input: [Message]
@@ -246,6 +306,31 @@ private struct ImageGenerationResponse: Decodable {
         }
         return image
     }
+}
+
+/// An image the user sent, inlined as a data URL so no public hosting is required.
+struct ImageAttachment: Sendable, Equatable {
+    /// Formats the Responses API accepts for `input_image`.
+    static let supportedMIMETypes = ["image/jpeg", "image/png", "image/gif", "image/webp"]
+    /// Base64 inflates payloads by about a third, so cap the raw bytes well under the request limit.
+    static let maxBytes = 15 * 1_024 * 1_024
+
+    let mimeType: String
+    let data: Data
+
+    init(mimeType: String, data: Data) throws {
+        let normalized = mimeType.lowercased()
+        guard Self.supportedMIMETypes.contains(normalized) else {
+            throw OpenAIError.RequestFailure("Unsupported image type: \(mimeType)")
+        }
+        guard !data.isEmpty, data.count <= Self.maxBytes else {
+            throw OpenAIError.RequestFailure("Image must be between 1 byte and \(Self.maxBytes) bytes")
+        }
+        self.mimeType = normalized
+        self.data = data
+    }
+
+    var dataURL: String { "data:\(mimeType);base64,\(data.base64EncodedString())" }
 }
 
 enum OpenAIReply {

@@ -91,7 +91,7 @@ struct TelegramRouteController: RouteCollection {
 
     private func handleMessage(_ message: TelegramMessage, req: Request) async throws {
         guard let userText = message.text, !userText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        if isResetCommand(userText) {
+        if shouldResetContext(userText) {
             try await conversations.reset(message.conversationKey)
             try await sendImageStatus("이 대화의 기억을 초기화했습니다.", message: message)
             return
@@ -238,7 +238,7 @@ struct TelegramRouteController: RouteCollection {
     private func completeGuestMessage(
         _ message: TelegramMessage, userText: String, sent: SentGuestMessage, req: Request
     ) async throws {
-        if isResetCommand(userText) {
+        if shouldResetContext(userText) {
             try await conversations.reset(message.conversationKey)
             try await editGuestText("이 대화의 기억을 초기화했습니다.", inlineMessageId: sent.inlineMessageId)
             return
@@ -324,6 +324,18 @@ func errorReport(_ error: any Error) -> String {
 
 func isResetCommand(_ text: String) -> Bool {
     text.trimmingCharacters(in: .whitespacesAndNewlines) == "/reset"
+}
+
+/// Anywhere in a message, this marker clears the stored context for that chat/topic.
+let contextResetTrigger = "BAWAPPIE_MAGIC_STRING_TRIGGER_CONTEXT_RESET"
+
+func containsContextResetTrigger(_ text: String) -> Bool {
+    text.range(of: contextResetTrigger, options: [.caseInsensitive, .literal]) != nil
+}
+
+/// `/reset` must stand alone; the magic string wins wherever it appears.
+func shouldResetContext(_ text: String) -> Bool {
+    isResetCommand(text) || containsContextResetTrigger(text)
 }
 
 private struct TelegramUpdate: Content {

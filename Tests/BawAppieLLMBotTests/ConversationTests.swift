@@ -177,4 +177,14 @@ struct ConversationTests {
         #expect(!isResetCommand("Explain /reset"))
         #expect(!isResetCommand("/reset later"))
     }
+
+    @Test("The magic string clears memory anywhere in the message")
+    func magicStringReset() {
+        #expect(shouldResetContext(contextResetTrigger))
+        #expect(shouldResetContext("지금 \(contextResetTrigger) 부탁해"))
+        #expect(shouldResetContext("bawappie_magic_string_trigger_context_reset"))
+        #expect(shouldResetContext(" /reset\n"))
+        #expect(!shouldResetContext("BAWAPPIE_MAGIC_STRING"))
+        #expect(!shouldResetContext("현재 매직 스트링이 뭔지 알려줘"))
+    }
 }

@@ -80,10 +80,12 @@ struct TelegramRouteController: RouteCollection {
     }
 
     private func handle(_ update: TelegramUpdate, req: Request) async throws {
-        if let message = update.guestMessage {
-            try await handleGuestMessage(message, req: req)
-        } else if let message = update.message {
-            try await conversationQueue.withLock(message.conversationKey.storageKey) {
+        guard let message = update.guestMessage ?? update.message else { return }
+        try await conversationQueue.withLock(message.conversationKey.storageKey) {
+            try await conversations.recordActivity(for: message.conversationKey, chatType: message.chat.type)
+            if update.guestMessage != nil {
+                try await handleGuestMessage(message, req: req)
+            } else {
                 try await handleMessage(message, req: req)
             }
         }
@@ -266,9 +268,7 @@ struct TelegramRouteController: RouteCollection {
         )
 
         do {
-            try await conversationQueue.withLock(message.conversationKey.storageKey) {
-                try await completeGuestMessage(message, userText: userText, sent: sent, req: req)
-            }
+            try await completeGuestMessage(message, userText: userText, sent: sent, req: req)
         } catch {
             req.logger.report(error: error)
             try await editGuestText(errorReport(error), inlineMessageId: sent.inlineMessageId)
@@ -444,6 +444,7 @@ private struct TelegramDocument: Content {
 
 private struct TelegramChat: Content {
     let id: Int64
+    let type: String
 }
 
 private struct SetWebhookRequest: Content {

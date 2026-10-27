@@ -6,6 +6,71 @@ import Testing
 struct ConversationTests {
     let key = ConversationKey(chatID: -100123, threadID: nil)
 
+    @Test("Only groups expire after at least 24 hours without activity",
+          arguments: ["group", "supergroup", "private", "channel"], [86_399.0, 86_400.0, 86_401.0])
+    func inactivityBoundary(chatType: String, elapsed: TimeInterval) async throws {
+        let store = try await ConversationStore.open(path: ":memory:")
+        let start = Date(timeIntervalSince1970: 1_000_000)
+        try await store.recordActivity(for: key, chatType: chatType, at: start)
+        try await store.append(user: "이전 질문", assistant: "이전 답변", for: key, at: start)
+        try await store.recordActivity(for: key, chatType: chatType, at: start.addingTimeInterval(elapsed))
+
+        let shouldExpire = ["group", "supergroup"].contains(chatType) && elapsed >= 86_400
+        #expect(try await store.history(for: key).isEmpty == shouldExpire)
+        try await store.close()
+    }
+
+    @Test("Messages without saved replies and delivered replies both extend group activity")
+    func activityExtendsDeadline() async throws {
+        let store = try await ConversationStore.open(path: ":memory:")
+        let start = Date(timeIntervalSince1970: 1_000_000)
+        try await store.recordActivity(for: key, chatType: "group", at: start)
+        try await store.append(user: "질문", assistant: "답변", for: key, at: start.addingTimeInterval(60))
+        try await store.recordActivity(for: key, chatType: "group", at: start.addingTimeInterval(86_400))
+        #expect(try await store.history(for: key).count == 2)
+        try await store.recordActivity(for: key, chatType: "group", at: start.addingTimeInterval(172_799))
+        #expect(try await store.history(for: key).count == 2)
+        // A delayed timestamp must not move the deadline backwards.
+        try await store.recordActivity(for: key, chatType: "group", at: start)
+        try await store.recordActivity(for: key, chatType: "group", at: start.addingTimeInterval(259_198))
+        #expect(try await store.history(for: key).count == 2)
+        try await store.recordActivity(for: key, chatType: "group", at: start.addingTimeInterval(345_598))
+        #expect(try await store.history(for: key).isEmpty)
+        try await store.append(user: "새 질문", assistant: "새 답변", for: key, at: start.addingTimeInterval(345_600))
+        #expect(try await store.history(for: key).map(\.content) == ["새 질문", "새 답변"])
+        try await store.close()
+    }
+
+    @Test("Inactivity survives restarting and expires only the matching room/topic")
+    func inactivityPersistenceAndIsolation() async throws {
+        let path = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .appendingPathComponent("conversation-\(UUID()).sqlite").path
+        defer {
+            for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: path + suffix) }
+        }
+        let store = try await ConversationStore.open(path: path)
+        let start = Date(timeIntervalSince1970: 1_000_000)
+        let otherRoom = ConversationKey(chatID: -456, threadID: nil)
+        let otherTopic = ConversationKey(chatID: key.chatID, threadID: 7)
+        for conversation in [key, otherRoom, otherTopic] {
+            // Pre-existing history has no activity timestamp: preserve it and start tracking now.
+            try await store.append(user: "기존 질문", assistant: "기존 답변", for: conversation, at: start)
+            try await store.recordActivity(for: conversation, chatType: "supergroup", at: start)
+            #expect(try await store.history(for: conversation).count == 2)
+        }
+        try await store.close()
+
+        let reopened = try await ConversationStore.open(path: path)
+        try await reopened.recordActivity(for: key, chatType: "supergroup", at: start.addingTimeInterval(86_400))
+        #expect(try await reopened.history(for: key).isEmpty)
+        #expect(try await reopened.history(for: otherRoom).count == 2)
+        #expect(try await reopened.history(for: otherTopic).count == 2)
+        try await reopened.close()
+        let afterExpiry = try await ConversationStore.open(path: path)
+        #expect(try await afterExpiry.history(for: key).isEmpty)
+        try await afterExpiry.close()
+    }
+
     @Test("History survives reopening, prunes to 20 pairs, and resets only its own room/topic")
     func persistenceAndIsolation() async throws {
         let path = FileManager.default.temporaryDirectory.appendingPathComponent("conversation-\(UUID()).sqlite").path

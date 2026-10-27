@@ -76,10 +76,43 @@ final class ConversationStore: Sendable {
                 CREATE INDEX IF NOT EXISTS conversation_turns_key_id
                 ON conversation_turns (conversation_key, id)
                 """).get()
+            _ = try await connection.query("""
+                CREATE TABLE IF NOT EXISTS conversation_activity (
+                    conversation_key TEXT PRIMARY KEY,
+                    last_activity REAL NOT NULL
+                )
+                """).get()
             return ConversationStore(connection: connection, maxTurns: maxTurns, maxHistoryBytes: maxHistoryBytes)
         } catch {
             try? await connection.close().get()
             throw error
+        }
+    }
+
+    /// Expire group history before recording the next message, even if it needs no reply.
+    /// Existing databases start tracking inactivity on the first message after upgrading.
+    func recordActivity(for key: ConversationKey, chatType: String, at date: Date = Date()) async throws {
+        guard chatType == "group" || chatType == "supergroup" else { return }
+        try await databaseQueue.withLock("database") {
+            let timestamp = date.timeIntervalSince1970
+            _ = try await self.connection.query("BEGIN IMMEDIATE").get()
+            do {
+                _ = try await self.connection.query("""
+                    DELETE FROM conversation_turns WHERE conversation_key = ? AND EXISTS (
+                        SELECT 1 FROM conversation_activity
+                        WHERE conversation_key = ? AND last_activity <= ?
+                    )
+                    """, [.text(key.storageKey), .text(key.storageKey), .float(timestamp - 24 * 60 * 60)]).get()
+                _ = try await self.connection.query("""
+                    INSERT INTO conversation_activity (conversation_key, last_activity) VALUES (?, ?)
+                    ON CONFLICT(conversation_key) DO UPDATE
+                    SET last_activity = MAX(last_activity, excluded.last_activity)
+                    """, [.text(key.storageKey), .float(timestamp)]).get()
+                _ = try await self.connection.query("COMMIT").get()
+            } catch {
+                _ = try? await self.connection.query("ROLLBACK").get()
+                throw error
+            }
         }
     }
 
@@ -104,7 +137,7 @@ final class ConversationStore: Sendable {
     }
 
     /// Save only a successfully delivered question/answer pair, then prune atomically.
-    func append(user: String, assistant: String, for key: ConversationKey) async throws {
+    func append(user: String, assistant: String, for key: ConversationKey, at date: Date = Date()) async throws {
         try await databaseQueue.withLock("database") {
             _ = try await self.connection.query("BEGIN IMMEDIATE").get()
             do {
@@ -117,6 +150,10 @@ final class ConversationStore: Sendable {
                         SELECT id FROM conversation_turns WHERE conversation_key = ? ORDER BY id DESC LIMIT ?
                     )
                     """, [.text(key.storageKey), .text(key.storageKey), .integer(.init(self.maxTurns))]).get()
+                _ = try await self.connection.query("""
+                    UPDATE conversation_activity SET last_activity = MAX(last_activity, ?)
+                    WHERE conversation_key = ?
+                    """, [.float(date.timeIntervalSince1970), .text(key.storageKey)]).get()
                 _ = try await self.connection.query("COMMIT").get()
             } catch {
                 _ = try? await self.connection.query("ROLLBACK").get()
